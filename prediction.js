@@ -939,13 +939,151 @@ const CAPITAL = {
     }
 };
 
+// ============================================================================
+// ============== V10.0 ADAPTIVE LAYER (NÂNG CẤP THUẬT TOÁN) ==================
+// Track accuracy thực, auto-flip logic kém, calibrate confidence trung thực,
+// mean-reversion guard, recommendation rõ ràng (VÀO/BỎ).
+// ============================================================================
+const ADAPTIVE = {
+    windowSize: 50,         // rolling window theo dõi acc của mỗi logic
+    minSamples: 8,          // tối thiểu mẫu mới đủ tin cậy đánh giá logic
+    flipThreshold: 0.40,    // acc < 40% → AUTO ĐẢO dự đoán
+    goodThreshold: 0.55,    // acc >= 55% → tin cậy, KHUYÊN VÀO
+    rolling: {}             // {gameId: {logicName: [{correct: bool, ts: number}, ...]}}
+};
+
+function _arr(gameId, logicName) {
+    if (!ADAPTIVE.rolling[gameId]) ADAPTIVE.rolling[gameId] = {};
+    if (!ADAPTIVE.rolling[gameId][logicName]) ADAPTIVE.rolling[gameId][logicName] = [];
+    return ADAPTIVE.rolling[gameId][logicName];
+}
+
+// Gọi sau khi chốt phiên thật để cập nhật accuracy của logic đã chọn
+function trackAdaptiveResult(gameId, logicName, predicted, actual) {
+    if (!logicName) return;
+    // Strip prefix "[ADAPTIVE-FLIP] " để gom về logic gốc
+    const baseName = logicName.replace(/^\[ADAPTIVE-FLIP\]\s*/, '').replace(/\s*\(acc.*$/, '').replace(/\s*\[BIAS:.*$/, '');
+    const arr = _arr(gameId, baseName);
+    arr.push({ correct: predicted === actual, ts: Date.now() });
+    while (arr.length > ADAPTIVE.windowSize) arr.shift();
+}
+
+function adaptiveStats(gameId, logicName) {
+    const baseName = (logicName || '').replace(/^\[ADAPTIVE-FLIP\]\s*/, '').replace(/\s*\(acc.*$/, '').replace(/\s*\[BIAS:.*$/, '');
+    const arr = _arr(gameId, baseName);
+    if (arr.length === 0) return { samples: 0, acc: 0.5, shouldFlip: false, trust: false };
+    const correct = arr.filter(x => x.correct).length;
+    const acc = correct / arr.length;
+    return {
+        samples: arr.length,
+        acc,
+        shouldFlip: arr.length >= ADAPTIVE.minSamples && acc < ADAPTIVE.flipThreshold,
+        trust: arr.length >= ADAPTIVE.minSamples && acc >= ADAPTIVE.goodThreshold
+    };
+}
+
+// Calibrate confidence dựa trên acc thực thay vì gán cứng 98%
+// 50% acc -> 55, 60% -> 70, 70% -> 80, >=80% -> 85 (cap)
+function calibratedConfidence(stats) {
+    if (stats.samples < ADAPTIVE.minSamples) return 60; // chưa đủ data
+    return Math.round(Math.min(85, Math.max(50, 55 + (stats.acc - 0.5) * 100)));
+}
+
+function getAdaptiveSnapshot() {
+    const out = {};
+    for (const gid of Object.keys(ADAPTIVE.rolling)) {
+        out[gid] = {};
+        for (const [name, arr] of Object.entries(ADAPTIVE.rolling[gid])) {
+            const correct = arr.filter(x => x.correct).length;
+            const acc = arr.length ? correct / arr.length : 0;
+            out[gid][name] = {
+                samples: arr.length,
+                correct,
+                accuracy: (acc * 100).toFixed(1) + '%',
+                status: arr.length < ADAPTIVE.minSamples ? 'CHƯA ĐỦ DATA'
+                       : acc < ADAPTIVE.flipThreshold ? 'XẤU - SẼ AUTO-FLIP'
+                       : acc >= ADAPTIVE.goodThreshold ? 'TỐT - TIN CẬY'
+                       : 'TRUNG BÌNH'
+            };
+        }
+    }
+    return out;
+}
+
+// HÀM CHÍNH MỚI: thay deepAnalysis ở server.js bằng hàm này
+function deepAnalysisAdaptive(gameId, S) {
+    const raw = deepAnalysis(gameId, S);
+    if (!raw.prediction) return { ...raw, adaptive: { recommendation: 'CHỜ DATA' } };
+
+    const stats = adaptiveStats(gameId, raw.logic);
+    let finalPred = raw.prediction;
+    let isReversal = raw.isReversal;
+    let logicMsg = raw.logic;
+
+    // 1. AUTO-FLIP: logic kém liên tục thì đảo ngược (anti-signal là signal)
+    if (stats.shouldFlip) {
+        finalPred = raw.prediction === 'TAI' ? 'XIU' : 'TAI';
+        isReversal = !isReversal;
+        logicMsg = `[ADAPTIVE-FLIP] ${raw.logic} (acc ${(stats.acc * 100).toFixed(0)}% → đảo)`;
+    }
+
+    // 2. MEAN REVERSION GUARD: 10 phiên gần đây lệch nặng → cảnh báo
+    const h10 = (S.history || []).slice(0, 10);
+    const taiCount = h10.filter(x => x === 1).length;
+    let biasNote = '';
+    let biasPenalty = 0;
+    if (h10.length === 10) {
+        if (taiCount >= 8 && finalPred === 'TAI') { biasNote = ' [BIAS: 8/10 Tài, cẩn thận]'; biasPenalty = 10; }
+        if (taiCount <= 2 && finalPred === 'XIU') { biasNote = ' [BIAS: 8/10 Xỉu, cẩn thận]'; biasPenalty = 10; }
+        // Cơ hội mean-reversion: streak dài rồi → khuyên đảo nhẹ (chỉ cảnh báo, không tự đảo)
+        if (taiCount >= 9 && finalPred === 'TAI') biasNote = ' [CỰC LỆCH: 9-10/10 Tài]';
+        if (taiCount <= 1 && finalPred === 'XIU') biasNote = ' [CỰC LỆCH: 9-10/10 Xỉu]';
+    }
+
+    // 3. CALIBRATED CONFIDENCE
+    let confidence = calibratedConfidence(stats) - biasPenalty;
+    confidence = Math.max(35, Math.min(85, confidence));
+
+    // 4. RECOMMENDATION rõ ràng
+    let recommendation;
+    if (stats.samples < ADAPTIVE.minSamples) recommendation = 'CHƯA ĐỦ DATA - QUAN SÁT';
+    else if (stats.trust && !biasPenalty) recommendation = 'VÀO LỆNH (logic ổn định)';
+    else if (stats.shouldFlip) recommendation = 'VÀO LỆNH (đã auto-đảo)';
+    else if (stats.acc >= 0.50) recommendation = 'CÂN NHẮC - vốn nhỏ';
+    else recommendation = 'NÊN BỎ QUA - không đủ tin cậy';
+
+    return {
+        ...raw,
+        prediction: finalPred,
+        isReversal,
+        logic: logicMsg + biasNote,
+        confidence,
+        rawConfidence: raw.confidence,
+        adaptive: {
+            logicAccuracy: (stats.acc * 100).toFixed(1) + '%',
+            samples: stats.samples,
+            flipped: stats.shouldFlip,
+            biased: biasPenalty > 0,
+            taiInLast10: taiCount,
+            recommendation,
+            trust: stats.trust
+        }
+    };
+}
+
 module.exports = {
     deepAnalysis,
+    deepAnalysisAdaptive,
     ensembleVote,
     quantumAnalysis,
     CAPITAL,
     logicPerformance,
     updateLogicPerformance,
+    // V10 adaptive
+    trackAdaptiveResult,
+    adaptiveStats,
+    getAdaptiveSnapshot,
+    ADAPTIVE,
     // export tất cả logic để có thể test riêng
     predictLogic1, predictLogic2, predictLogic3, predictLogic4, predictLogic5,
     predictLogic6, predictLogic7, predictLogic8, predictLogic9, predictLogic10,
