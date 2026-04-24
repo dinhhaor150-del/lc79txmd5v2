@@ -1,11 +1,23 @@
 // ============================================================================
-// VI LONG SUPER AI - SERVER V9.2
-// Express server fetch dữ liệu game LC79 và serve dự đoán Tài Xỉu
+// VI LONG SUPER AI - SERVER V10.0 (NÂNG CẤP THUẬT TOÁN ADAPTIVE)
+// - Lưu tối đa 2000 phiên trong RAM (cũ 605)
+// - Persist 1500 phiên xuống data.json (cũ 200)
+// - /history/:gameId mặc định trả 1000 phiên, hỗ trợ ?limit=N hoặc ?limit=all
+// - Dùng deepAnalysisAdaptive: auto-flip logic xấu, calibrate confidence,
+//   mean-reversion guard, recommendation rõ ràng
+// - /adaptive expose stats từng logic theo dõi rolling
 // ============================================================================
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const { deepAnalysis, CAPITAL, updateLogicPerformance, logicPerformance } = require('./prediction');
+const {
+    deepAnalysisAdaptive,
+    trackAdaptiveResult,
+    getAdaptiveSnapshot,
+    CAPITAL,
+    updateLogicPerformance,
+    logicPerformance
+} = require('./prediction');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,30 +34,36 @@ const GAMES = {
     }
 };
 
+// ==================== STORAGE LIMITS (V10) ====================
+const MAX_PRED_LOG = 2000;     // RAM cap (cũ 605)
+const PERSIST_LIMIT = 1500;    // ghi xuống data.json (cũ 200)
+const DEFAULT_HISTORY_LIMIT = 1000;
+
 // ==================== STATE PER GAME ====================
 const STATE = {};
 for (const gid of Object.keys(GAMES)) {
     STATE[gid] = {
         lastPhien: 0,
         lastTotal: 0,
-        history: [],         // mảng nhị phân (1=Tài, 0=Xỉu) - mới nhất ở [0]
-        totals: [],          // mảng tổng xúc xắc tương ứng
-        diceData: [],        // [{d1, d2, d3, sid, ts}, ...] - mới nhất ở [0]
+        history: [],
+        totals: [],
+        diceData: [],
         currentPrediction: null,
         currentLogic: '',
         currentConfidence: 0,
         currentExpected: [],
+        currentAdaptive: null,
         isReversal: false,
         reversalFrom: '',
         recentHistory: '',
         updatedAt: null,
-        predLog: [],         // [{phien, prediction, confidence, logic, actual, correct, ts}]
+        predLog: [],
         votes: { tai: 0, xiu: 0 },
         details: {}
     };
 }
 
-// ==================== PERSISTENCE (lưu lại sau restart) ====================
+// ==================== PERSISTENCE ====================
 const DATA_FILE = path.join(__dirname, 'data.json');
 function saveState() {
     try {
@@ -54,7 +72,7 @@ function saveState() {
             const S = STATE[gid];
             dump[gid] = {
                 lastPhien: S.lastPhien,
-                predLog: S.predLog.slice(0, 200)
+                predLog: S.predLog.slice(0, PERSIST_LIMIT)
             };
         }
         fs.writeFileSync(DATA_FILE, JSON.stringify(dump));
@@ -100,7 +118,6 @@ async function updateGame(gid) {
     const list = await fetchGameData(gid);
     if (!list) return;
 
-    // Build mảng nhị phân, totals, diceData từ list (mới nhất ở [0])
     const cap = Math.min(list.length, 100);
     const newHistory = [];
     const newTotals = [];
@@ -131,7 +148,6 @@ async function updateGame(gid) {
 
     const latestPhien = list[0].id || list[0].sid || 0;
 
-    // Khi có phiên mới
     if (latestPhien > S.lastPhien) {
         const actual = (newHistory[0] === 1) ? 'TAI' : 'XIU';
 
@@ -141,21 +157,26 @@ async function updateGame(gid) {
             pending.actual = actual;
             pending.actualTotal = newTotals[0];
             pending.correct = pending.prediction === actual;
-            // update performance từng logic dựa trên details
+
+            // Update performance từng logic con
             const actualVN = actual === 'TAI' ? 'Tài' : 'Xỉu';
             for (const [logicName, predicted] of Object.entries(pending.details || {})) {
                 updateLogicPerformance(logicName, predicted, actualVN);
             }
+
+            // V10: track logic FINAL (đã qua adaptive layer)
+            trackAdaptiveResult(gid, pending.logic, pending.prediction, actual);
         }
 
         S.lastPhien = latestPhien;
 
-        // Tính dự đoán cho phiên tới
-        const result = deepAnalysis(gid, S);
+        // V10: dùng deepAnalysisAdaptive thay deepAnalysis
+        const result = deepAnalysisAdaptive(gid, S);
         S.currentPrediction = result.prediction;
         S.currentLogic = result.logic;
         S.currentConfidence = result.confidence;
         S.currentExpected = result.expectedNumbers;
+        S.currentAdaptive = result.adaptive;
         S.isReversal = result.isReversal;
         S.reversalFrom = result.reversalFrom;
         S.votes = result.votes;
@@ -167,29 +188,31 @@ async function updateGame(gid) {
                 phien: latestPhien + 1,
                 prediction: result.prediction,
                 confidence: result.confidence,
+                rawConfidence: result.rawConfidence,
                 logic: result.logic,
                 isReversal: result.isReversal,
                 expectedNumbers: result.expectedNumbers,
                 votes: result.votes,
                 details: result.details,
+                adaptive: result.adaptive,
                 actual: null,
                 correct: null,
                 ts: Date.now()
             });
-            if (S.predLog.length > 605) S.predLog.length = 605;
+            if (S.predLog.length > MAX_PRED_LOG) S.predLog.length = MAX_PRED_LOG;
         }
 
-        console.log(`[${gid}] phien ${latestPhien} -> ${actual} | next ${latestPhien + 1}: ${result.prediction} ${result.confidence}% (${result.logic})`);
+        const rec = result.adaptive ? result.adaptive.recommendation : '';
+        console.log(`[${gid}] phien ${latestPhien} -> ${actual} | next ${latestPhien + 1}: ${result.prediction} ${result.confidence}% (${result.logic}) | ${rec}`);
     }
 }
 
-// Khởi động loop
 for (const gid of Object.keys(GAMES)) {
     updateGame(gid);
     setInterval(() => updateGame(gid), 3000);
 }
 
-// ==================== CORS MIDDLEWARE ====================
+// ==================== CORS ====================
 app.use((req, res, next) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -198,7 +221,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// ==================== STATIC ====================
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ==================== ROUTES ====================
@@ -219,38 +241,75 @@ app.get('/predict/:gameId', (req, res) => {
         expectedNumbers: S.currentExpected,
         lastTotal: S.lastTotal,
         recentHistory: S.recentHistory,
-        votes: S.votes
+        votes: S.votes,
+        adaptive: S.currentAdaptive
     });
 });
 
+// V10: history mặc định 1000, hỗ trợ ?limit=N | ?limit=all | ?onlyCompleted=1
 app.get('/history/:gameId', (req, res) => {
     const gid = req.params.gameId;
     if (!STATE[gid]) return res.status(404).json({ error: 'Game not found' });
     const S = STATE[gid];
+
+    let pool = S.predLog;
+    if (req.query.onlyCompleted === '1') {
+        pool = pool.filter(p => p.actual !== null);
+    }
+
     const completed = S.predLog.filter(p => p.actual !== null);
     const correct = completed.filter(p => p.correct).length;
     const total = completed.length;
     const accuracy = total > 0 ? `${((correct / total) * 100).toFixed(1)}%` : '--';
+
+    let limit = Math.min(DEFAULT_HISTORY_LIMIT, pool.length);
+    if (req.query.limit) {
+        if (req.query.limit === 'all') {
+            limit = pool.length;
+        } else {
+            const n = parseInt(req.query.limit);
+            if (!isNaN(n) && n > 0) limit = Math.min(n, pool.length);
+        }
+    }
+
     res.json({
         game: GAMES[gid].name,
         accuracy,
         correct,
         total,
-        history: S.predLog.slice(0, 50).map(p => ({
+        stored: S.predLog.length,
+        maxCapacity: MAX_PRED_LOG,
+        returned: limit,
+        history: pool.slice(0, limit).map(p => ({
             phien: p.phien,
             prediction: p.prediction,
             confidence: p.confidence,
+            rawConfidence: p.rawConfidence,
             logic: p.logic,
             isReversal: p.isReversal,
             expectedNumbers: p.expectedNumbers,
             actual: p.actual,
             actualTotal: p.actualTotal,
-            correct: p.correct
+            correct: p.correct,
+            adaptive: p.adaptive,
+            ts: p.ts
         }))
     });
 });
 
-// API quản lý vốn (server-side calc)
+// V10: Stats adaptive layer (acc rolling từng logic, status TỐT/XẤU)
+app.get('/adaptive', (req, res) => {
+    res.json({
+        snapshot: getAdaptiveSnapshot(),
+        config: {
+            windowSize: 50,
+            minSamples: 8,
+            flipThreshold: '40%',
+            goodThreshold: '55%'
+        }
+    });
+});
+
 app.get('/capital/calc', (req, res) => {
     const current = parseInt(req.query.current) || 0;
     const target = parseInt(req.query.target) || 1000000;
@@ -259,7 +318,6 @@ app.get('/capital/calc', (req, res) => {
     res.json(CAPITAL.calculateBet(current, target, mode, confidence));
 });
 
-// Performance từng logic
 app.get('/performance', (req, res) => {
     const out = {};
     for (const [k, v] of Object.entries(logicPerformance)) {
@@ -275,15 +333,22 @@ app.get('/performance', (req, res) => {
     res.json(out);
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), games: Object.keys(GAMES) }));
+app.get('/health', (req, res) => res.json({
+    status: 'ok',
+    version: '10.0',
+    uptime: process.uptime(),
+    games: Object.keys(GAMES),
+    storage: { ramCap: MAX_PRED_LOG, persistCap: PERSIST_LIMIT, defaultHistoryLimit: DEFAULT_HISTORY_LIMIT }
+}));
 
 app.get('/', (req, res, next) => {
     if (fs.existsSync(path.join(__dirname, 'public', 'index.html'))) return next();
-    res.send('<h1>VI LONG AI</h1><p>API: /predict/lc79_hu, /predict/lc79_md5, /history/...</p>');
+    res.send('<h1>VI LONG AI V10</h1><p>API: /predict/:gameId, /history/:gameId?limit=1000, /adaptive, /performance, /health</p>');
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[VI LONG AI V9.2] Server running on port ${PORT}`);
+    console.log(`[VI LONG AI V10.0 ADAPTIVE] Server running on port ${PORT}`);
+    console.log(`[STORAGE] RAM cap: ${MAX_PRED_LOG} | persist: ${PERSIST_LIMIT} | default history: ${DEFAULT_HISTORY_LIMIT}`);
     console.log(`[GAMES] ${Object.keys(GAMES).join(', ')}`);
 });
 
